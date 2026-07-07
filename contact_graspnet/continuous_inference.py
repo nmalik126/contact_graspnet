@@ -5,6 +5,8 @@ import numpy as np
 import time
 import glob
 import cv2
+import pyrealsense2 as rs
+import open3d as o3d
 
 import tensorflow.compat.v1 as tf
 tf.disable_eager_execution()
@@ -19,7 +21,46 @@ from data import regularize_pc_point_count, depth2pc, load_available_input_data
 from contact_grasp_estimator import GraspEstimator
 from visualization_utils import visualize_grasps, show_image
 
-def inference(global_config, checkpoint_dir, input_paths, K=None, local_regions=True, skip_border_objects=False, filter_grasps=True, segmap_id=None, z_range=[0.2,1.8], forward_passes=1):
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 5)
+config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 5)
+profile = pipeline.start(config)
+
+device = profile.get_device()
+depth_sensor = device.first_depth_sensor()
+depth_sensor.set_option(rs.option.visual_preset, 5) # Default - 0, High Accuracy - 3, High Density - 4, Medium Density - 5
+depth_scale = depth_sensor.get_depth_scale()
+
+align_to = rs.stream.color
+align = rs.align(align_to)
+
+intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+cam_K = np.array([
+    [intrinsics.fx, 0, intrinsics.ppx],
+    [0, intrinsics.fy, intrinsics.ppy],
+    [0, 0, 1],
+])
+distCoeffs = np.asarray(intrinsics.coeffs)
+
+transform = np.load('/home/noor/polyROIExtrinsics/cam_to_world.npy')
+
+o3d_intrinsics = o3d.camera.PinholeCameraIntrinsic(
+    width=848,
+    height=480,
+    fx=cam_K[0, 0],
+    fy=cam_K[1, 1],
+    cx=cam_K[0, 2],
+    cy=cam_K[1, 2],
+)
+aabb = o3d.geometry.AxisAlignedBoundingBox(
+    min_bound=(-0.2, 0.0, 0.01), 
+    max_bound=(-0.05, 0.2, 0.1),
+)
+
+scale = 0.08 / 0.045
+
+def inference(global_config, checkpoint_dir, input_path, K=None, local_regions=True, skip_border_objects=False, filter_grasps=True, segmap_id=None, z_range=[0.2,1.8], forward_passes=1):
     """
     Predict 6-DoF grasp distribution for given model and input data
     
@@ -54,40 +95,65 @@ def inference(global_config, checkpoint_dir, input_paths, K=None, local_regions=
     os.makedirs('results', exist_ok=True)
 
     # Process example test scenes
-    for p in glob.glob(input_paths):
-        print('Loading ', p)
+    try:
+        while True:
+            # get frames
+            frames = pipeline.wait_for_frames()
+            aligned_frames = align.process(frames)
 
-        pc_segments = {}
-        segmap, rgb, depth, cam_K, pc_full, pc_colors = load_available_input_data(p, K=K)
-        
-        if segmap is None and (local_regions or filter_grasps):
-            raise ValueError('Need segmentation map to extract local regions or filter grasps')
+            aligned_depth_frame = aligned_frames.get_depth_frame() # aligned_depth_frame is a 640x480 depth image
+            color_frame = aligned_frames.get_color_frame()
+            if not aligned_depth_frame or not color_frame:
+                continue
 
-        if pc_full is None:
-            print('Converting depth to point cloud(s)...')
-            pc_full, pc_segments, pc_colors = grasp_estimator.extract_point_clouds(depth, cam_K, segmap=segmap, rgb=rgb,
-                                                                                    skip_border_objects=skip_border_objects, z_range=z_range)
+            depth_image = np.asanyarray(aligned_depth_frame.get_data())
+            depth = depth_image * depth_scale
+            rgb = np.asanyarray(color_frame.get_data())
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
-        print('Generating Grasps...')
-        scale = 0.08 / 0.045
-        pc_full *= scale
-        pc_segments = {k: v * scale for k, v in pc_segments.items()}
-        pred_grasps_cam, scores, contact_pts, _ = grasp_estimator.predict_scene_grasps(sess, pc_full, pc_segments=pc_segments, 
-                                                                                          local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes)  
+            # compute segmap
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                o3d.geometry.Image(rgb), 
+                o3d.geometry.Image(depth_image),
+                depth_scale=1000.0,
+                depth_trunc=100.0,
+                convert_rgb_to_intensity=False,
+            )
+            pcd_full = o3d.geometry.PointCloud.create_from_rgbd_image(
+                image=rgbd_image,
+                intrinsic=o3d_intrinsics,
+                extrinsic=transform,
+                project_valid_depth_only=False
+            )
+            obj_mask = aabb.get_point_indices_within_bounding_box(pcd_full.points)
+            segmap = np.zeros(848*480, dtype=bool)
+            segmap[obj_mask] = True
+            segmap = segmap.reshape((480, 848))
 
-        # Save results
-        np.savez('results/predictions_{}'.format(os.path.basename(p.replace('png','npz').replace('npy','npz'))), 
-                  pred_grasps_cam=pred_grasps_cam, scores=scores, contact_pts=contact_pts)
+            # generate grasp poses
+            pc_full, pc_segments, pc_colors = grasp_estimator.extract_point_clouds(
+                depth, cam_K, segmap=segmap, rgb=rgb, 
+                skip_border_objects=skip_border_objects, z_range=z_range
+            )
+            pc_full *= scale
+            pc_segments = {k: v * scale for k, v in pc_segments.items()}
+            pred_grasps_cam, scores, contact_pts, _ = grasp_estimator.predict_scene_grasps(
+                sess, pc_full, pc_segments=pc_segments, 
+                local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes
+            )  
 
-        # Visualize results          
-        show_image(rgb, segmap)
-        visualize_grasps(pc_full, pred_grasps_cam, scores, plot_opencv_cam=True, pc_colors=pc_colors)
+            # Visualize results          
+            # show_image(rgb, segmap)
+            # visualize_grasps(pc_full, pred_grasps_cam, scores, plot_opencv_cam=True, pc_colors=pc_colors)
 
-        print(pred_grasps_cam)
-        print(scores)
-        
-    if not glob.glob(input_paths):
-        print('No files found: ', input_paths)
+            # print(pred_grasps_cam)
+            # print(scores)
+            
+            print(len(scores[True]))
+
+    finally:
+        pipeline.stop()
+        cv2.destroyAllWindows()
         
 if __name__ == "__main__":
 
