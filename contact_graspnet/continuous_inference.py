@@ -7,6 +7,7 @@ import glob
 import cv2
 import pyrealsense2 as rs
 import open3d as o3d
+import lcm
 
 import tensorflow.compat.v1 as tf
 tf.disable_eager_execution()
@@ -20,6 +21,11 @@ from data import regularize_pc_point_count, depth2pc, load_available_input_data
 
 from contact_grasp_estimator import GraspEstimator
 from visualization_utils import visualize_grasps, show_image
+
+module_path = os.path.abspath(os.path.join('..'))
+if module_path not in sys.path:
+    sys.path.append(module_path)
+from lcmdefs.messages.so101 import lcmt_so101_grasp
 
 pipeline = rs.pipeline()
 config = rs.config()
@@ -60,6 +66,15 @@ aabb = o3d.geometry.AxisAlignedBoundingBox(
 
 scale = 0.08 / 0.045
 
+d_eff = 0.1034 / scale
+my_depth = 0.058
+offset = d_eff - my_depth
+offset_gripper_frame = np.eye(4)
+offset_gripper_frame[2, 3] = offset
+
+msg = lcmt_so101_grasp()
+lc = lcm.LCM()
+
 def inference(global_config, checkpoint_dir, input_path, K=None, local_regions=True, skip_border_objects=False, filter_grasps=True, segmap_id=None, z_range=[0.2,1.8], forward_passes=1):
     """
     Predict 6-DoF grasp distribution for given model and input data
@@ -97,6 +112,7 @@ def inference(global_config, checkpoint_dir, input_path, K=None, local_regions=T
     # Process example test scenes
     try:
         while True:
+        # for _ in range(1):
             # get frames
             frames = pipeline.wait_for_frames()
             aligned_frames = align.process(frames)
@@ -135,12 +151,24 @@ def inference(global_config, checkpoint_dir, input_path, K=None, local_regions=T
                 depth, cam_K, segmap=segmap, rgb=rgb, 
                 skip_border_objects=skip_border_objects, z_range=z_range
             )
+
             pc_full *= scale
             pc_segments = {k: v * scale for k, v in pc_segments.items()}
+            
             pred_grasps_cam, scores, contact_pts, _ = grasp_estimator.predict_scene_grasps(
                 sess, pc_full, pc_segments=pc_segments, 
                 local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes
-            )  
+            )
+
+            candidates = pred_grasps_cam[True]
+            candidates[:, :3, 3] /= scale
+            candidates = np.linalg.inv(transform) @ candidates
+            candidates = candidates @ offset_gripper_frame
+            top_candidate = candidates[np.argmax(scores[True])]
+            print(top_candidate)
+
+            msg.grasp = top_candidate.astype(np.float64).flatten().tolist()
+            lc.publish("SO101_GRASP", msg.encode())
 
             # Visualize results          
             # show_image(rgb, segmap)
@@ -149,7 +177,7 @@ def inference(global_config, checkpoint_dir, input_path, K=None, local_regions=T
             # print(pred_grasps_cam)
             # print(scores)
             
-            print(len(scores[True]))
+            # print(len(scores[True]))
 
     finally:
         pipeline.stop()
