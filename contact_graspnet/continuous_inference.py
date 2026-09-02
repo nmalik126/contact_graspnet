@@ -8,6 +8,7 @@ import cv2
 import pyrealsense2 as rs
 import open3d as o3d
 import lcm
+from scipy.spatial.transform import Rotation
 
 import tensorflow.compat.v1 as tf
 tf.disable_eager_execution()
@@ -67,10 +68,12 @@ aabb = o3d.geometry.AxisAlignedBoundingBox(
 scale = 0.08 / 0.045
 
 d_eff = 0.1034 / scale
-my_depth = 0.058
+# d_eff = 0.1034
+my_depth = 0.01
 offset = d_eff - my_depth
 offset_gripper_frame = np.eye(4)
-offset_gripper_frame[2, 3] = offset
+offset_gripper_frame[0, 3] = -0.015
+offset_gripper_frame[2, 3] = -offset
 
 msg = lcmt_so101_grasp()
 lc = lcm.LCM()
@@ -160,19 +163,25 @@ def inference(global_config, checkpoint_dir, input_path, K=None, local_regions=T
                 local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes
             )
 
-            candidates = pred_grasps_cam[True]
-            candidates[:, :3, 3] /= scale
-            candidates = np.linalg.inv(transform) @ candidates
-            candidates = candidates @ offset_gripper_frame
-            top_candidate = candidates[np.argmax(scores[True])]
-            print(top_candidate)
-
-            msg.grasp = top_candidate.astype(np.float64).flatten().tolist()
-            lc.publish("SO101_GRASP", msg.encode())
+            if len(scores[True]) == 0:
+                continue
+            top_idx = np.argmax(scores[True])
 
             # Visualize results          
             # show_image(rgb, segmap)
             # visualize_grasps(pc_full, pred_grasps_cam, scores, plot_opencv_cam=True, pc_colors=pc_colors)
+            # visualize_grasps(pc_full, {True: pred_grasps_cam[True][top_idx:top_idx+1]}, {True: scores[True][top_idx:top_idx+1]}, plot_opencv_cam=True, pc_colors=pc_colors)
+            
+            candidates = pred_grasps_cam[True]
+            candidates[:, :3, 3] /= scale
+            candidates = np.linalg.inv(transform) @ candidates
+            candidates = candidates @ offset_gripper_frame
+            top_candidate = candidates[top_idx]
+            print(top_candidate)
+
+            msg.grasp = top_candidate.astype(np.float64).flatten().tolist()
+            # print(msg.grasp)
+            lc.publish("SO101_GRASP", msg.encode())
 
             # print(pred_grasps_cam)
             # print(scores)
