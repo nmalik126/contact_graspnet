@@ -65,7 +65,7 @@ class SO101GraspGenerator:
         self.inference()
         logging.info("started grasp generator")
 
-    def inference(self) -> np.ndarray | None:
+    def inference(self):
         filtered = o3d.io.read_point_cloud(self.pcd_path)
         obj_mask = self.aabb.get_point_indices_within_bounding_box(filtered.points)
         filtered.transform(self.T_cam_world)
